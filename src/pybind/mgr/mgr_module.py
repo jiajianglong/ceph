@@ -1,12 +1,45 @@
 
 import ceph_module  # noqa
 
-import json
 import logging
+import json
+import six
 import threading
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 import rados
+import time
 
+PG_STATES = [
+        "active",
+        "clean",
+        "down",
+        "recovery_unfound",
+        "backfill_unfound",
+        "scrubbing",
+        "degraded",
+        "inconsistent",
+        "peering",
+        "repair",
+        "recovering",
+        "forced_recovery",
+        "backfill_wait",
+        "incomplete",
+        "stale",
+        "remapped",
+        "deep",
+        "backfilling",
+        "forced_backfill",
+        "backfill_toofull",
+        "recovery_wait",
+        "recovery_toofull",
+        "undersized",
+        "activating",
+        "peered",
+        "snaptrim",
+        "snaptrim_wait",
+        "snaptrim_error",
+        "creating",
+        "unknown"]
 
 class CPlusPlusHandler(logging.Handler):
     def __init__(self, module_inst):
@@ -51,7 +84,7 @@ class CommandResult(object):
     """
     Use with MgrModule.send_command
     """
-    def __init__(self, tag):
+    def __init__(self, tag=None):
         self.ev = threading.Event()
         self.outs = ""
         self.outb = ""
@@ -59,7 +92,7 @@ class CommandResult(object):
 
         # This is just a convenience for notifications from
         # C++ land, to avoid passing addresses around in messages.
-        self.tag = tag
+        self.tag = tag if tag else ""
 
     def complete(self, r, outb, outs):
         self.r = r
@@ -72,6 +105,28 @@ class CommandResult(object):
         return self.r, self.outb, self.outs
 
 
+class HandleCommandResult(namedtuple('HandleCommandResult', ['retval', 'stdout', 'stderr'])):
+    def __new__(cls, retval=0, stdout="", stderr=""):
+        """
+        Tuple containing the result of `handle_command()`
+
+        Only write to stderr if there is an error, or in extraordinary circumstances
+
+        Avoid having `ceph foo bar` commands say "did foo bar" on success unless there
+        is critical information to include there.
+
+        Everything programmatically consumable should be put on stdout
+
+        :param retval: return code. E.g. 0 or -errno.EINVAL
+        :type retval: int
+        :param stdout: data of this result.
+        :type stdout: str
+        :param stderr: Typically used for error messages.
+        :type stderr: str
+        """
+        return super(HandleCommandResult, cls).__new__(cls, retval, stdout, stderr)
+
+
 class OSDMap(ceph_module.BasePyOSDMap):
     def get_epoch(self):
         return self._get_epoch()
@@ -81,6 +136,16 @@ class OSDMap(ceph_module.BasePyOSDMap):
 
     def dump(self):
         return self._dump()
+
+    def get_pools(self):
+        # FIXME: efficient implementation
+        d = self._dump()
+        return dict([(p['pool'], p) for p in d['pools']])
+
+    def get_pools_by_name(self):
+        # FIXME: efficient implementation
+        d = self._dump()
+        return dict([(p['pool_name'], p) for p in d['pools']])
 
     def new_incremental(self):
         return self._new_incremental()
@@ -103,6 +168,18 @@ class OSDMap(ceph_module.BasePyOSDMap):
     def map_pool_pgs_up(self, poolid):
         return self._map_pool_pgs_up(poolid)
 
+    def pg_to_up_acting_osds(self, pool_id, ps):
+        return self._pg_to_up_acting_osds(pool_id, ps)
+
+    def pool_raw_used_rate(self, pool_id):
+        return self._pool_raw_used_rate(pool_id)
+
+    def get_ec_profile(self, name):
+        # FIXME: efficient implementation
+        d = self._dump()
+        return d['erasure_code_profiles'].get(name, None)
+
+
 class OSDMapIncremental(ceph_module.BasePyOSDMapIncremental):
     def get_epoch(self):
         return self._get_epoch()
@@ -123,6 +200,7 @@ class OSDMapIncremental(ceph_module.BasePyOSDMapIncremental):
         """
         return self._set_crush_compat_weight_set_weights(weightmap)
 
+
 class CRUSHMap(ceph_module.BasePyCRUSH):
     ITEM_NONE = 0x7fffffff
     DEFAULT_CHOOSE_ARGS = '-1'
@@ -141,7 +219,7 @@ class CRUSHMap(ceph_module.BasePyCRUSH):
 
     def get_take_weight_osd_map(self, root):
         uglymap = self._get_take_weight_osd_map(root)
-        return { int(k): v for k, v in uglymap.get('weights', {}).iteritems() }
+        return { int(k): v for k, v in six.iteritems(uglymap.get('weights', {})) }
 
     @staticmethod
     def have_default_choose_args(dump):
@@ -150,6 +228,66 @@ class CRUSHMap(ceph_module.BasePyCRUSH):
     @staticmethod
     def get_default_choose_args(dump):
         return dump.get('choose_args').get(CRUSHMap.DEFAULT_CHOOSE_ARGS, [])
+
+    def get_rule(self, rule_name):
+        # TODO efficient implementation
+        for rule in self.dump()['rules']:
+            if rule_name == rule['rule_name']:
+                return rule
+
+        return None
+
+    def get_rule_by_id(self, rule_id):
+        for rule in self.dump()['rules']:
+            if rule['rule_id'] == rule_id:
+                return rule
+
+        return None
+
+    def get_rule_root(self, rule_name):
+        rule = self.get_rule(rule_name)
+        if rule is None:
+            return None
+
+        try:
+            first_take = [s for s in rule['steps'] if s['op'] == 'take'][0]
+        except IndexError:
+            self.log.warn("CRUSH rule '{0}' has no 'take' step".format(
+                rule_name))
+            return None
+        else:
+            return first_take['item']
+
+    def get_osds_under(self, root_id):
+        # TODO don't abuse dump like this
+        d = self.dump()
+        buckets = dict([(b['id'], b) for b in d['buckets']])
+
+        osd_list = []
+
+        def accumulate(b):
+            for item in b['items']:
+                if item['id'] >= 0:
+                    osd_list.append(item['id'])
+                else:
+                    try:
+                        accumulate(buckets[item['id']])
+                    except KeyError:
+                        pass
+
+        accumulate(buckets[root_id])
+
+        return osd_list
+
+    def device_class_counts(self):
+        result = defaultdict(int)
+        # TODO don't abuse dump like this
+        d = self.dump()
+        for device in d['devices']:
+            cls = device.get('class', None)
+            result[cls] += 1
+
+        return dict(result)
 
 
 class MgrStandbyModule(ceph_module.BaseMgrStandbyModule):
@@ -184,7 +322,7 @@ class MgrStandbyModule(ceph_module.BaseMgrStandbyModule):
     def get_mgr_id(self):
         return self._ceph_get_mgr_id()
 
-    def get_config(self, key, default=None):
+    def get_module_option(self, key, default=None):
         """
         Retrieve the value of a persistent configuration setting
 
@@ -192,20 +330,32 @@ class MgrStandbyModule(ceph_module.BaseMgrStandbyModule):
         :param default: the default value of the config if it is not found
         :return: str
         """
-        r = self._ceph_get_config(key)
+        r = self._ceph_get_module_option(key)
         if r is None:
-            return default
+            final_key = key.split('/')[-1]
+            return self.MODULE_OPTION_DEFAULTS.get(final_key, default)
         else:
             return r
 
+    def get_ceph_option(self, key):
+        return self._ceph_get_option(key)
+
+    def get_store(self, key):
+        """
+        Retrieve the value of a persistent KV store entry
+
+        :param key: String
+        :return: Byte string or None
+        """
+        return self._ceph_get_store(key)
 
     def get_active_uri(self):
         return self._ceph_get_active_uri()
 
-    def get_localized_config(self, key, default=None):
-        r = self.get_config(self.get_mgr_id() + '/' + key)
+    def get_localized_module_option(self, key, default=None):
+        r = self.get_module_option(self.get_mgr_id() + '/' + key)
         if r is None:
-            r = self.get_config(key)
+            r = self.get_module_option(key)
 
         if r is None:
             r = default
@@ -213,6 +363,8 @@ class MgrStandbyModule(ceph_module.BaseMgrStandbyModule):
 
 class MgrModule(ceph_module.BaseMgrModule):
     COMMANDS = []
+    MODULE_OPTIONS = []
+    MODULE_OPTION_DEFAULTS = {}
 
     # Priority definitions for perf counters
     PRIO_CRITICAL = 10
@@ -229,12 +381,19 @@ class MgrModule(ceph_module.BaseMgrModule):
     PERFCOUNTER_LONGRUNAVG = 4
     PERFCOUNTER_COUNTER = 8
     PERFCOUNTER_HISTOGRAM = 0x10
-    PERFCOUNTER_TYPE_MASK = ~2
+    PERFCOUNTER_TYPE_MASK = ~3
 
     # units supported
     BYTES = 0
     NONE = 1
-    
+
+    # Cluster log priorities
+    CLUSTER_LOG_PRIO_DEBUG = 0
+    CLUSTER_LOG_PRIO_INFO = 1
+    CLUSTER_LOG_PRIO_SEC = 2
+    CLUSTER_LOG_PRIO_WARN = 3
+    CLUSTER_LOG_PRIO_ERROR = 4
+
     def __init__(self, module_name, py_modules_ptr, this_ptr):
         self.module_name = module_name
 
@@ -252,23 +411,38 @@ class MgrModule(ceph_module.BaseMgrModule):
         # Keep a librados instance for those that need it.
         self._rados = None
 
+        for o in self.MODULE_OPTIONS:
+            if 'default' in o:
+                if 'type' in o:
+                    # we'll assume the declared type matches the
+                    # supplied default value's type.
+                    self.MODULE_OPTION_DEFAULTS[o['name']] = o['default']
+                else:
+                    # module not declaring it's type, so normalize the
+                    # default value to be a string for consistent behavior
+                    # with default and user-supplied option values.
+                    self.MODULE_OPTION_DEFAULTS[o['name']] = str(o['default'])
+
     def __del__(self):
         unconfigure_logger(self, self.module_name)
-
-    def update_perf_schema(self, daemon_type, daemon_name):
-        """
-        For plugins that use get_all_perf_counters, call this when
-        receiving a notification of type 'perf_schema_update', to
-        prompt MgrModule to update its cache of counter schemas.
-
-        :param daemon_type:
-        :param daemon_name:
-        :return:
-        """
 
     @property
     def log(self):
         return self._logger
+
+    def cluster_log(self, channel, priority, message):
+        """
+        :param channel: The log channel. This can be 'cluster', 'audit', ...
+        :type channel: str
+        :param priority: The log message priority. This can be
+                         CLUSTER_LOG_PRIO_DEBUG, CLUSTER_LOG_PRIO_INFO,
+                         CLUSTER_LOG_PRIO_SEC, CLUSTER_LOG_PRIO_WARN or
+                         CLUSTER_LOG_PRIO_ERROR.
+        :type priority: int
+        :param message: The message to log.
+        :type message: str
+        """
+        self._ceph_cluster_log(channel, priority, message)
 
     @property
     def version(self):
@@ -284,6 +458,22 @@ class MgrModule(ceph_module.BaseMgrModule):
         """
         Called by the ceph-mgr service to notify the Python plugin
         that new state is available.
+
+        :param notify_type: string indicating what kind of notification,
+                            such as osd_map, mon_map, fs_map, mon_status,
+                            health, pg_summary, command, service_map
+        :param notify_id:  string (may be empty) that optionally specifies
+                            which entity is being notified about.  With
+                            "command" notifications this is set to the tag
+                            ``from send_command``.
+        """
+        pass
+
+    def config_notify(self):
+        """
+        Called by the ceph-mgr service to notify the Python plugin
+        that the configuration may have changed.  Modules will want to
+        refresh any configuration values stored in config variables.
         """
         pass
 
@@ -314,7 +504,8 @@ class MgrModule(ceph_module.BaseMgrModule):
 
         :param str data_name: Valid things to fetch are osd_crush_map_text, 
                 osd_map, osd_map_tree, osd_map_crush, config, mon_map, fs_map,
-                osd_metadata, pg_summary, df, osd_stats, health, mon_status.
+                osd_metadata, pg_summary, io_rate, pg_dump, df, osd_stats,
+                health, mon_status, devices, device <devid>.
 
         Note:
             All these structures have their own JSON representations: experiment
@@ -337,12 +528,71 @@ class MgrModule(ceph_module.BaseMgrModule):
         
         return ''
 
+    def _perfvalue_to_value(self, stattype, value):
+        if stattype & self.PERFCOUNTER_TIME:
+            # Convert from ns to seconds
+            return value / 1000000000.0
+        else:
+            return value
+
     def _unit_to_str(self, unit):
         if unit == self.NONE:
             return "/s"
         elif unit == self.BYTES:
             return "B/s"  
-    
+
+    def to_pretty_iec(self, n):
+        for bits, suffix in [(60, 'Ei'), (50, 'Pi'), (40, 'Ti'), (30, 'Gi'),
+                (20, 'Mi'), (10, 'Ki')]:
+            if n > 10 << bits:
+                return str(n >> bits) + ' ' + suffix
+        return str(n) + ' '
+
+    def get_pretty_row(self, elems, width):
+        """
+        Takes an array of elements and returns a string with those elements
+        formatted as a table row. Useful for polling modules.
+
+        :param elems: the elements to be printed
+        :param width: the width of the terminal
+        """
+        n = len(elems)
+        column_width = int(width / n)
+
+        ret = '|'
+        for elem in elems:
+            ret += '{0:>{w}} |'.format(elem, w=column_width - 2)
+
+        return ret
+
+    def get_pretty_header(self, elems, width):
+        """
+        Like ``get_pretty_row`` but adds dashes, to be used as a table title.
+
+        :param elems: the elements to be printed
+        :param width: the width of the terminal
+        """
+        n = len(elems)
+        column_width = int(width / n)
+
+        # dash line
+        ret = '+'
+        for i in range(0, n):
+            ret += '-' * (column_width - 1) + '+'
+        ret += '\n'
+
+        # title
+        ret += self.get_pretty_row(elems, width)
+        ret += '\n'
+
+        # dash line
+        ret += '+'
+        for i in range(0, n):
+            ret += '-' * (column_width - 1) + '+'
+        ret += '\n'
+
+        return ret
+
     def get_server(self, hostname):
         """
         Called by the plugin to fetch metadata about a particular hostname from
@@ -381,6 +631,20 @@ class MgrModule(ceph_module.BaseMgrModule):
         """
         return self._ceph_get_counter(svc_type, svc_name, path)
 
+    def get_latest_counter(self, svc_type, svc_name, path):
+        """
+        Called by the plugin to fetch only the newest performance counter data
+        pointfor a particular counter on a particular service.
+
+        :param str svc_type:
+        :param str svc_name:
+        :param str path: a period-separated concatenation of the subsystem and the
+            counter name, for example "mds.inodes".
+        :return: A list of two-tuples of (timestamp, value) is returned.  This may be
+            empty if no data is available.
+        """
+        return self._ceph_get_latest_counter(svc_type, svc_name, path)
+
     def list_servers(self):
         """
         Like ``get_server``, but gives information about all servers (i.e. all
@@ -395,10 +659,14 @@ class MgrModule(ceph_module.BaseMgrModule):
         """
         Fetch the daemon metadata for a particular service.
 
+        ceph-mgr fetches metadata asynchronously, so are windows of time during
+        addition/removal of services where the metadata is not available to
+        modules.  ``None`` is returned if no metadata is available.
+
         :param str svc_type: service type (e.g., 'mds', 'osd', 'mon')
         :param str svc_id: service id. convert OSD integer IDs to strings when
             calling this
-        :rtype: dict
+        :rtype: dict, or None if no metadata found
         """
         return self._ceph_get_metadata(svc_type, svc_id)
 
@@ -406,11 +674,36 @@ class MgrModule(ceph_module.BaseMgrModule):
         """
         Fetch the latest status for a particular service daemon.
 
+        This method may return ``None`` if no status information is
+        available, for example because the daemon hasn't fully started yet.
+
         :param svc_type: string (e.g., 'rgw')
         :param svc_id: string
-        :return: dict
+        :return: dict, or None if the service is not found
         """
         return self._ceph_get_daemon_status(svc_type, svc_id)
+
+    def mon_command(self, cmd_dict):
+        """
+        Helper for modules that do simple, synchronous mon command
+        execution.
+
+        See send_command for general case.
+
+        :return: status int, out std, err str
+        """
+
+        t1 = time.time()
+        result = CommandResult()
+        self.send_command(result, "mon", "", json.dumps(cmd_dict), "")
+        r = result.wait()
+        t2 = time.time()
+
+        self.log.debug("mon_command: '{0}' -> {1} in {2:.3f}s".format(
+            cmd_dict['prefix'], r[0], t2 - t1
+        ))
+
+        return r
 
     def send_command(self, *args, **kwargs):
         """
@@ -437,10 +730,10 @@ class MgrModule(ceph_module.BaseMgrModule):
 
     def set_health_checks(self, checks):
         """
-        Set module's health checks
-
         Set the module's current map of health checks.  Argument is a
         dict of check names to info, in this form:
+
+        ::
 
            {
              'CHECK_FOO': {
@@ -459,7 +752,7 @@ class MgrModule(ceph_module.BaseMgrModule):
         """
         self._ceph_set_health_checks(checks)
 
-    def handle_command(self, cmd):
+    def handle_command(self, inbuf, cmd):
         """
         Called by ceph-mgr to request the plugin to handle one
         of the commands that it declared in self.COMMANDS
@@ -468,9 +761,12 @@ class MgrModule(ceph_module.BaseMgrModule):
         output string.  The output buffer is for data results,
         the output string is for informative text.
 
-        :param dict cmd: from Ceph's cmdmap_t
+        :param inbuf: content of any "-i <file>" supplied to ceph cli
+        :type inbuf: str
+        :param cmd: from Ceph's cmdmap_t
+        :type cmd: dict
 
-        :return: 3-tuple of (int, str, str)
+        :return: HandleCommandResult or a 3-tuple of (int, str, str)
         """
 
         # Should never get called if they didn't declare
@@ -479,94 +775,135 @@ class MgrModule(ceph_module.BaseMgrModule):
 
     def get_mgr_id(self):
         """
-        Retrieve the mgr id.
+        Retrieve the name of the manager daemon where this plugin
+        is currently being executed (i.e. the active manager).
 
         :return: str
         """
         return self._ceph_get_mgr_id()
 
-    def get_config(self, key, default=None):
+    def get_ceph_option(self, key):
+        return self._ceph_get_option(key)
+
+    def _validate_module_option(self, key):
+        """
+        Helper: don't allow get/set config callers to 
+        access config options that they didn't declare
+        in their schema.
+        """
+        if key not in [o['name'] for o in self.MODULE_OPTIONS]:
+            raise RuntimeError("Config option '{0}' is not in {1}.MODULE_OPTIONS".\
+                    format(key, self.__class__.__name__))
+
+    def _get_module_option(self, key, default):
+        r = self._ceph_get_module_option(key)
+        if r is None:
+            final_key = key.split('/')[-1]
+            return self.MODULE_OPTION_DEFAULTS.get(final_key, default)
+        else:
+            return r
+
+    def get_module_option(self, key, default=None):
         """
         Retrieve the value of a persistent configuration setting
 
         :param str key:
         :return: str
         """
-        r = self._ceph_get_config(key)
-        if r is None:
-            return default
-        else:
-            return r
+        self._validate_module_option(key)
+        return self._get_module_option(key, default)
 
-    def get_config_prefix(self, key_prefix):
+    def get_store_prefix(self, key_prefix):
         """
-        Retrieve a dict of config values with the given prefix
+        Retrieve a dict of KV store keys to values, where the keys
+        have the given prefix
 
         :param str key_prefix:
         :return: str
         """
-        return self._ceph_get_config_prefix(key_prefix)
+        return self._ceph_get_store_prefix(key_prefix)
 
-    def get_localized_config(self, key, default=None):
+    def _get_localized(self, key, default, getter):
+        r = getter(self.get_mgr_id() + '/' + key, None)
+        if r is None:
+            r = getter(key, default)
+
+        return r
+
+    def _set_localized(self, key, val, setter):
+        return setter(self.get_mgr_id() + '/' + key, val)
+
+    def get_localized_module_option(self, key, default=None):
         """
         Retrieve localized configuration for this ceph-mgr instance
         :param str key:
         :param str default:
         :return: str
         """
-        r = self.get_config(self.get_mgr_id() + '/' + key)
-        if r is None:
-            r = self.get_config(key)
+        self._validate_module_option(key)
+        return self._get_localized(key, default, self._get_module_option)
 
-        if r is None:
-            r = default
-        return r
+    def _set_module_option(self, key, val):
+        return self._ceph_set_module_option(key, str(val))
 
-    def set_config(self, key, val):
+    def set_module_option(self, key, val):
         """
         Set the value of a persistent configuration setting
 
         :param str key:
         :param str val:
         """
-        self._ceph_set_config(key, val)
+        self._validate_module_option(key)
+        return self._set_module_option(key, val)
 
-    def set_localized_config(self, key, val):
+    def set_localized_module_option(self, key, val):
         """
         Set localized configuration for this ceph-mgr instance
         :param str key:
         :param str default:
         :return: str
         """
-        return self._ceph_set_config(self.get_mgr_id() + '/' + key, val)
+        self._validate_module_option(key)
+        return self._set_localized(key, val, self._set_module_option)
 
-    def set_config_json(self, key, val):
+    def set_store(self, key, val):
         """
-        Helper for setting json-serialized-config
-
-        :param str key:
-        :param val: json-serializable object
-        """
-        self._ceph_set_config(key, json.dumps(val))
-
-    def get_config_json(self, key):
-        """
-        Helper for getting json-serialized config
+        Set a value in this module's persistent key value store.
+        If val is None, remove key from store
 
         :param str key:
-        :return: object
+        :param str val:
         """
-        raw = self.get_config(key)
-        if raw is None:
-            return None
+        self._ceph_set_store(key, val)
+
+    def get_store(self, key, default=None):
+        """
+        Get a value from this module's persistent key value store
+        """
+        r = self._ceph_get_store(key)
+        if r is None:
+            return default
         else:
-            return json.loads(raw)
+            return r
+
+    def get_localized_store(self, key, default=None):
+        return self._get_localized(key, default, self.get_store)
+
+    def set_localized_store(self, key, val):
+        return self._set_localized(key, val, self.set_store)
+
 
     def self_test(self):
         """
         Run a self-test on the module. Override this function and implement
         a best as possible self-test for (automated) testing of the module
-        :return: bool
+
+        Indicate any failures by raising an exception.  This does not have
+        to be pretty, it's mainly for picking up regressions during
+        development, rather than use in the field.
+
+        :return: None, or an advisory string for developer interest, such
+                 as a json dump of some state.
         """
         pass
 
@@ -578,12 +915,26 @@ class MgrModule(ceph_module.BaseMgrModule):
         """
         return self._ceph_get_osdmap()
 
+    def get_latest(self, daemon_type, daemon_name, counter):
+        data = self.get_latest_counter(daemon_type, daemon_name, counter)[counter]
+        if data:
+            return data[1]
+        else:
+            return 0
+
+    def get_latest_avg(self, daemon_type, daemon_name, counter):
+        data = self.get_latest_counter(daemon_type, daemon_name, counter)[counter]
+        if data:
+            return (data[1], data[2])
+        else:
+            return (0, 0)
+
     def get_all_perf_counters(self, prio_limit=PRIO_USEFUL):
         """
         Return the perf counters currently known to this ceph-mgr
         instance, filtered by priority equal to or greater than `prio_limit`.
 
-        The result us a map of string to dict, associating services
+        The result is a map of string to dict, associating services
         (like "osd.123") with their counters.  The counter
         dict for each service maps counter paths to a counter
         info structure, which is the information from
@@ -593,18 +944,10 @@ class MgrModule(ceph_module.BaseMgrModule):
 
         result = defaultdict(dict)
 
-        # TODO: improve C++->Python interface to return just
-        # the latest if that's all we want.
-        def get_latest(daemon_type, daemon_name, counter):
-            data = self.get_counter(daemon_type, daemon_name, counter)[counter]
-            if data:
-                return data[-1][1]
-            else:
-                return 0
 
         for server in self.list_servers():
             for service in server['services']:
-                if service['type'] not in ("mds", "osd", "mon"):
+                if service['type'] not in ("rgw", "mds", "osd", "mon"):
                     continue
 
                 schema = self.get_perf_schema(service['type'], service['id'])
@@ -627,8 +970,24 @@ class MgrModule(ceph_module.BaseMgrModule):
                     if counter_schema['priority'] < prio_limit:
                         continue
 
-                    counter_info = counter_schema
-                    counter_info['value'] = get_latest(service['type'], service['id'], counter_path)
+                    counter_info = dict(counter_schema)
+
+                    # Also populate count for the long running avgs
+                    if counter_schema['type'] & self.PERFCOUNTER_LONGRUNAVG:
+                        v, c = self.get_latest_avg(
+                            service['type'],
+                            service['id'],
+                            counter_path
+                        )
+                        counter_info['value'], counter_info['count'] = v, c
+                        result[svc_full_name][counter_path] = counter_info
+                    else:
+                        counter_info['value'] = self.get_latest(
+                            service['type'],
+                            service['id'],
+                            counter_path
+                        )
+
                     result[svc_full_name][counter_path] = counter_info
 
         self.log.debug("returning {0} counter".format(len(result)))
@@ -684,3 +1043,65 @@ class MgrModule(ceph_module.BaseMgrModule):
         """
 
         return True, ""
+
+    def remote(self, module_name, method_name, *args, **kwargs):
+        """
+        Invoke a method on another module.  All arguments, and the return
+        value from the other module must be serializable.
+
+        :param module_name: Name of other module.  If module isn't loaded,
+                            an ImportError exception is raised.
+        :param method_name: Method name.  If it does not exist, a NameError
+                            exception is raised.
+        :param args: Argument tuple
+        :param kwargs: Keyword argument dict
+        :return:
+        """
+        return self._ceph_dispatch_remote(module_name, method_name,
+                                          args, kwargs)
+
+    def add_osd_perf_query(self, query):
+        """
+        Register an OSD perf query.  Argument is a
+        dict of the query parameters, in this form:
+
+        ::
+
+           {
+             'key_descriptor': [
+               {'type': subkey_type, 'regex': regex_pattern},
+               ...
+             ],
+             'performance_counter_descriptors': [
+               list, of, descriptor, types
+             ],
+             'limit': {'order_by': performance_counter_type, 'max_count': n},
+           }
+
+        Valid subkey types:
+           'client_id', 'client_address', 'pool_id', 'namespace', 'osd_id',
+           'pg_id', 'object_name', 'snap_id'
+        Valid performance counter types:
+           'ops', 'write_ops', 'read_ops', 'bytes', 'write_bytes', 'read_bytes',
+           'latency', 'write_latency', 'read_latency'
+
+        :param object query: query
+        :rtype: int (query id)
+        """
+        return self._ceph_add_osd_perf_query(query)
+
+    def remove_osd_perf_query(self, query_id):
+        """
+        Unregister an OSD perf query.
+
+        :param int query_id: query ID
+        """
+        return self._ceph_remove_osd_perf_query(query_id)
+
+    def get_osd_perf_counters(self, query_id):
+        """
+        Get stats collected for an OSD perf query.
+
+        :param int query_id: query ID
+        """
+        return self._ceph_get_osd_perf_counters(query_id)

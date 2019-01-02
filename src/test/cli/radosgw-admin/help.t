@@ -33,6 +33,7 @@
     bi list                    list raw bucket index entries
     bi purge                   purge bucket index entries
     object rm                  remove object
+    object put                 put object
     object stat                stat an object for its metadata
     object unlink              unlink object from bucket index
     object rewrite             rewrite the specified object
@@ -104,14 +105,15 @@
                                (NOTE: required to specify formatting of date
                                to "YYYY-MM-DD-hh")
     log rm                     remove log object
-    usage show                 show usage (by user, date range)
-    usage trim                 trim usage (by user, date range)
+    usage show                 show usage (by user, by bucket, date range)
+    usage trim                 trim usage (by user, by bucket, date range)
     usage clear                reset all the usage stats for the cluster
     gc list                    dump expired garbage collection objects (specify
                                --include-all to list all entries, including unexpired)
     gc process                 manually process garbage (specify
                                --include-all to process all entries, including unexpired)
     lc list                    list all bucket lifecycle progress
+    lc get                     get a lifecycle bucket configuration
     lc process                 manually process lifecycle
     metadata get               get metadata info
     metadata put               put metadata info
@@ -126,14 +128,6 @@
     datalog list               list data log
     datalog trim               trim data log
     datalog status             read data log status
-    opstate list               list stateful operations entries (use client_id,
-                               op_id, object)
-    opstate set                set state on an entry (use client_id, op_id, object, state)
-    opstate renew              renew state on an entry (use client_id, op_id, object)
-    opstate rm                 remove entry (use client_id, op_id, object)
-    replicalog get             get replica metadata log entry
-    replicalog update          update replica metadata log entry
-    replicalog rm              remove replica metadata log entry
     orphans find               init and run search for leaked rados objects (use job-id, pool)
     orphans finish             clean up search for leaked rados objects
     orphans list-jobs          list the current job-ids for orphans search
@@ -151,8 +145,16 @@
     reshard status             read bucket resharding status
     reshard process            process of scheduled reshard jobs
     reshard cancel             cancel resharding a bucket
+    reshard stale-instances list list stale-instances from bucket resharding
+    reshard stale-instances rm   cleanup stale-instances from bucket resharding
     sync error list            list sync error
     sync error trim            trim sync error
+    mfa create                 create a new MFA TOTP token
+    mfa list                   list MFA TOTP tokens
+    mfa get                    show MFA TOTP token
+    mfa remove                 delete MFA TOTP token
+    mfa check                  check MFA TOTP token
+    mfa resync                 re-sync MFA TOTP token
   options:
      --tenant=<tenant>         tenant name
      --uid=<id>                user id
@@ -171,6 +173,7 @@
      --max-buckets             max number of buckets for a user
      --admin                   set the admin flag on the user
      --system                  set the system flag on the user
+     --op-mask                 set the op mask on the user
      --bucket=<bucket>         Specify the bucket name. Also used by the quota command.
      --pool=<pool>             Specify the pool name. Also used to scan for leaked rados objects.
      --object=<object>         object name
@@ -178,14 +181,16 @@
      --start-date=<date>       start date in the format yyyy-mm-dd
      --end-date=<date>         end date in the format yyyy-mm-dd
      --bucket-id=<bucket-id>   bucket id
-     --shard-id=<shard-id>     optional for mdlog list
+     --shard-id=<shard-id>     optional for: 
+                                 mdlog list
+                                 data sync status
                                required for: 
                                  mdlog trim
-                                 replica mdlog get/delete
-                                 replica datalog get/delete
+     --max-entries=<entries>   max entries for listing operations
      --metadata-key=<key>      key to retrieve metadata from with metadata get
      --remote=<remote>         zone or zonegroup id of remote gateway
      --period=<id>             period id
+     --url=<url>               url for pushing/pulling period/realm
      --epoch=<number>          period epoch
      --commit                  commit the period during 'period update'
      --staging                 get staging period info
@@ -239,15 +244,12 @@
                                (NOTE: required to delete a non-empty bucket)
      --sync-stats              option to 'user stats', update user stats with current
                                stats reported by user's buckets indexes
+     --reset-stats             option to 'user stats', reset stats in accordance with user buckets
      --show-log-entries=<flag> enable/disable dump of log entries on log show
      --show-log-sum=<flag>     enable/disable dump of log summation on log show
      --skip-zero-entries       log show only dumps entries that don't have zero value
                                in one of the numeric field
      --infile=<file>           specify a file to read in when setting data
-     --state=<state>           specify a state for the opstate set command
-     --replica-log-type=<logtypestr>
-                               replica log type (metadata, data, bucket), required for
-                               replica log operations
      --categories=<list>       comma separated list of categories, used in usage show
      --caps=<caps>             list of caps (e.g., "usage=read, write; user=read")
      --yes-i-really-mean-it    required for certain operations
@@ -261,6 +263,8 @@
      --min-rewrite-size        min object size for bucket rewrite (default 4M)
      --max-rewrite-size        max object size for bucket rewrite (default ULLONG_MAX)
      --min-rewrite-stripe-size min stripe size for object rewrite (default 0)
+     --trim-delay-ms           time interval in msec to limit the frequency of sync error log entries trimming operations,
+                               the trimming process will sleep the specified msec for every 1000 entries trimmed
   
   <date> := "YYYY-MM-DD[ hh:mm:ss]"
   
@@ -286,6 +290,13 @@
      --policy-doc              permission policy document
      --path-prefix             path prefix for filtering roles
   
+  MFA options:
+     --totp-serial             a string that represents the ID of a TOTP token
+     --totp-seed               the secret seed that is used to calculate the TOTP
+     --totp-seconds            the time resolution that is being used for TOTP generation
+     --totp-window             the number of TOTP tokens that are checked before and after the current token when validating token
+     --totp-pin                the valid value of a TOTP token at a certain time
+  
     --conf/-c FILE    read configuration from the given configuration file
     --id ID           set ID portion of my name
     --name/-n TYPE.ID set name
@@ -294,6 +305,5 @@
     --setgroup GROUP  set gid to group or gid
     --version         show version and quit
   
-  [1]
 
 

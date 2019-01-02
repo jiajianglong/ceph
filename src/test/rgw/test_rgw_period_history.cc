@@ -13,6 +13,7 @@
  */
 #include "rgw/rgw_period_history.h"
 #include "rgw/rgw_rados.h"
+#include "rgw/rgw_zone.h"
 #include "global/global_init.h"
 #include "common/ceph_argparse.h"
 #include <boost/lexical_cast.hpp>
@@ -45,7 +46,7 @@ using Ids = std::vector<std::string>;
 class RecordingPuller : public RGWPeriodHistory::Puller {
   const int error;
  public:
-  RecordingPuller(int error) : error(error) {}
+  explicit RecordingPuller(int error) : error(error) {}
   Ids ids;
   int pull(const std::string& id, RGWPeriod& period) override {
     ids.push_back(id);

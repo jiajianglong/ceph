@@ -25,6 +25,7 @@ function run() {
     CEPH_ARGS+="--fsid=$(uuidgen) --auth-supported=none "
     CEPH_ARGS+="--mon-host=$CEPH_MON "
 
+    export -n CEPH_CLI_TEST_DUP_COMMAND
     local funcs=${@:-$(set | sed -n -e 's/^\(TEST_[0-9a-z_]*\) .*/\1/p')}
     for func in $funcs ; do
         $func $dir || return 1
@@ -127,3 +128,4 @@ main osd-recovery-scrub "$@"
 # Local Variables:
 # compile-command: "cd build ; make -j4 && \
 #    ../qa/run-standalone.sh osd-recovery-scrub.sh"
+# End:

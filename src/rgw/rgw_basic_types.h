@@ -1,5 +1,6 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
 // vim: ts=8 sw=2 smarttab
+
 #ifndef CEPH_RGW_BASIC_TYPES_H
 #define CEPH_RGW_BASIC_TYPES_H
 
@@ -31,7 +32,7 @@ struct rgw_user {
     encode(id, bl);
     ENCODE_FINISH(bl);
   }
-  void decode(bufferlist::iterator& bl) {
+  void decode(bufferlist::const_iterator& bl) {
     DECODE_START(1, bl);
     decode(tenant, bl);
     decode(id, bl);
@@ -119,7 +120,7 @@ class Principal {
   types t;
   rgw_user u;
 
-  Principal(types t)
+  explicit Principal(types t)
     : t(t) {}
 
   Principal(types t, std::string&& n, std::string i)

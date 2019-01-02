@@ -28,6 +28,8 @@ for configuring any sync plugin
    :maxdepth: 1
 
    ElasticSearch Sync Module <elastic-sync-module>
+   Cloud Sync Module <cloud-sync-module>
+   PubSub Module <pubsub-module>
 
 .. note ``rgw`` is the default sync plugin and there is no need to explicitly
    configure this
@@ -92,3 +94,5 @@ Now start the radosgw in the zone
 .. _`Multisite`: ../multisite
 .. _`elasticsearch sync module`: ../elastic-sync-module
 .. _`elasticsearch`: ../elastic-sync-module
+.. _`cloud sync module`: ../cloud-sync-module
+.. _`pubsub module`: ../pubsub-module

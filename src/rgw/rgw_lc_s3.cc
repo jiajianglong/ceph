@@ -1,3 +1,6 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// vim: ts=8 sw=2 smarttab
+
 #include <string.h>
 
 #include <iostream>
@@ -69,6 +72,11 @@ bool RGWLifecycleConfiguration_S3::xml_end(const char *el) {
   while (rule) {
     add_rule(rule);
     rule = static_cast<LCRule_S3 *>(iter.get_next());
+  }
+  if (cct->_conf->rgw_lc_max_rules < rule_map.size()) {
+    ldout(cct, 5) << "Warn: The lifecycle config has too many rules, rule number is:" 
+                  << rule_map.size() << ", max number is:" << cct->_conf->rgw_lc_max_rules << dendl;
+    return false;
   }
   return true;
 }

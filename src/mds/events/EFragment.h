@@ -22,7 +22,7 @@ struct dirfrag_rollback {
   fnode_t fnode;
   dirfrag_rollback() { }
   void encode(bufferlist& bl) const;
-  void decode(bufferlist::iterator& bl);
+  void decode(bufferlist::const_iterator& bl);
 };
 WRITE_CLASS_ENCODER(dirfrag_rollback)
 
@@ -33,7 +33,7 @@ public:
   inodeno_t ino;
   frag_t basefrag;
   __s32 bits{0};         // positive for split (from basefrag), negative for merge (to basefrag)
-  list<frag_t> orig_frags;
+  frag_vec_t orig_frags;
   bufferlist rollback;
 
   EFragment() : LogEvent(EVENT_FRAGMENT) { }
@@ -71,7 +71,7 @@ public:
   EMetaBlob *get_metablob() override { return &metablob; }
 
   void encode(bufferlist &bl, uint64_t features) const override;
-  void decode(bufferlist::iterator &bl) override;
+  void decode(bufferlist::const_iterator &bl) override;
   void dump(Formatter *f) const override;
   static void generate_test_instances(list<EFragment*>& ls);
   void replay(MDSRank *mds) override;
